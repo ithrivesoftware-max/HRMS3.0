@@ -1,0 +1,1321 @@
+"use client";
+
+/**
+ * HR portal store — separate login, leave workflow, payslip dispatch log and
+ * salary bank-transfer batches. Persisted independently so
+ * the HR portal has its own session, but the data (leave approvals, payroll
+ * totals) is read by the main Admin/Accounts/CEO views too.
+ */
+
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import { HR_EMPLOYEES, seedUnitFor, seedTrainingFor, type HrEmployee, type ExitRecord } from "@/lib/hr-data";
+import { SEED_HR_USERS } from "@/lib/seed-data";
+import { allCategories, allDepartments, allAgents, type WorkerCategory, type Agent } from "@/lib/hr-master";
+import { payDaysFromMarks, type WageScheme } from "@/lib/mill-wages";
+import { wageSchemeFor } from "@/lib/payroll";
+
+export type HrRole = "HR Manager" | "HR Executive" | "Manager" | "CEO" | "Admin" | "Super Admin";
+
+export const HR_ROLES: HrRole[] = ["HR Executive", "HR Manager", "Manager", "Admin", "CEO", "Super Admin"];
+
+export interface HrUser {
+  name: string;
+  role: HrRole;
+  loginId: string;
+}
+
+/**
+ * A named HR login account. Multiple HR staff sign in with their own
+ * loginId/password so every change they make is attributed to them by
+ * name, not a free-typed display name — see `withAudit`.
+ *
+ * Sign-in is checked on the server (/api/login) against a scrypt hash in
+ * hr_users. `password` here is only set while creating / resetting an account
+ * (sent once, hashed on save); accounts loaded from the database carry "".
+ */
+export interface HrUserAccount {
+  id: string;
+  loginId: string;
+  password: string;
+  name: string;
+  role: HrRole;
+  active: boolean;
+  createdAt: string;
+  createdBy: string; // "by" of whoever created the account
+}
+
+/** Roles allowed to create/edit/deactivate HR login accounts. */
+export const CAN_MANAGE_USERS_ROLES: HrRole[] = ["CEO", "Admin", "Super Admin"];
+export const canManageUsers = (role?: HrRole) => !!role && CAN_MANAGE_USERS_ROLES.includes(role);
+
+/** Roles allowed to bulk-import the employee master from Excel. */
+// Edit access opened to every login (per request): all HR roles may import.
+export const CAN_IMPORT_ROLES: HrRole[] = [...HR_ROLES];
+export const canImportData = (role?: HrRole) => !!role && CAN_IMPORT_ROLES.includes(role);
+
+/** Roles allowed to create / rename company units (branches). */
+export const CAN_MANAGE_UNITS_ROLES: HrRole[] = [...HR_ROLES];
+export const canManageUnits = (role?: HrRole) => !!role && CAN_MANAGE_UNITS_ROLES.includes(role);
+
+// ---- Go-live data lock ----------------------------------------------------
+// Migration phase: Admin feeds the historical data and may edit everything.
+// Once the data is verified and Admin confirms it, the master data is LOCKED —
+// edit/delete controls disappear for everyone except CEO and Super Admin, so a
+// figure that feeds salary / PF / ESI / OT / incentives / agent commission (and
+// therefore a statutory return) can't be changed casually after go-live.
+
+// NOTE: edit access is opened to every login (per request). The data-lock
+// role lists below are kept (still used by the lock/re-open audit flow) but
+// now include every HR role, so a lock no longer removes anyone's edit rights.
+/** Roles that keep edit rights after the data has been locked. */
+export const CAN_EDIT_LOCKED_ROLES: HrRole[] = [...HR_ROLES];
+/** Roles that may edit master data during the (unlocked) data-feeding phase. */
+export const CAN_EDIT_UNLOCKED_ROLES: HrRole[] = [...HR_ROLES];
+/** Roles that may confirm-and-lock, or re-open, the master data. */
+export const CAN_LOCK_ROLES: HrRole[] = ["CEO", "Super Admin", "Admin"];
+export const canLockData = (role?: HrRole) => !!role && CAN_LOCK_ROLES.includes(role);
+
+/**
+ * May this user edit master data right now?
+ * Unlocked (feeding phase) → Admin/HR Manager/CEO/Super Admin.
+ * Locked (live)            → CEO / Super Admin only.
+ */
+export function canEditData(role: HrRole | undefined, _locked: boolean): boolean {
+  // Edit access opened to every login: any signed-in role may edit, whether or
+  // not the data has been locked. (Lock still records who/when in the audit log.)
+  return !!role;
+}
+
+export interface DataLock {
+  locked: boolean;
+  at?: string;
+  by?: string;
+  note?: string;
+}
+
+/**
+ * Recording an exit or a re-join, and editing an already-recorded exit, is
+ * restricted to CEO / Super Admin: it moves someone off the roll, changes the
+ * on-roll report and drives the full-and-final settlement.
+ */
+export const CAN_MANAGE_EXITS_ROLES: HrRole[] = [...HR_ROLES];
+export const canManageExits = (role?: HrRole) => !!role && CAN_MANAGE_EXITS_ROLES.includes(role);
+
+/** Roles allowed to extend the master data (categories, departments, reports). */
+export const CAN_MANAGE_MASTERS_ROLES: HrRole[] = [...HR_ROLES];
+export const canManageMasters = (role?: HrRole) => !!role && CAN_MANAGE_MASTERS_ROLES.includes(role);
+
+/**
+ * A report Admin/CEO builds in the app: pick the columns, pick who it covers,
+ * save it, and it runs against live data — no code change needed.
+ */
+export type ReportScope = "all" | "category" | "unit" | "department" | "employees";
+
+export interface CustomReport {
+  id: string;
+  name: string;
+  description?: string;
+  /** Column keys from REPORT_FIELDS, in the order they should appear. */
+  fields: string[];
+  scope: ReportScope;
+  /** Category id / unit name / department name, or the employee ids for "employees". */
+  scopeValues: string[];
+  createdAt: string;
+  createdBy: string;
+}
+
+/** The two branches Mehala runs today — seeded; Admin/CEO can add/rename more. */
+export const SEED_UNITS = ["Unit 1", "Unit 2"];
+
+export type LeaveType = "EL" | "CL" | "SL" | "LOP";
+export interface LeaveRequest {
+  id: string;
+  empId: string;
+  empName: string;
+  type: LeaveType;
+  from: string;
+  to: string;
+  days: number;
+  reason: string;
+  status: "Pending" | "Approved by Manager" | "Approved" | "Rejected";
+  appliedOn: string;
+}
+
+export interface PayslipSend {
+  id: string;
+  empId: string;
+  empName: string;
+  channel: "WhatsApp" | "Email";
+  month: string;
+  netPay: number;
+  at: string;
+}
+
+export interface TransferBatch {
+  id: string;
+  month: string;
+  count: number;
+  total: number;
+  bankFile: string;
+  status: "Draft" | "Sent to Bank" | "Processed";
+  at: string;
+}
+
+/** The payroll month the portal is operating on. */
+// The working day/month follow the real calendar, so the app rolls into each
+// new month by itself (attendance, payroll and reports default to it).
+const _now = new Date();
+const _p2 = (n: number) => String(n).padStart(2, "0");
+export const TODAY = `${_now.getFullYear()}-${_p2(_now.getMonth() + 1)}-${_p2(_now.getDate())}`;
+export const CURRENT_MONTH = TODAY.slice(0, 7);
+export const CURRENT_MONTH_LABEL = new Date(`${CURRENT_MONTH}-01T00:00:00`).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+
+/** Monthly attendance summary — the basis for day-wage pay & incentives. */
+/**
+ * What the mill's salary register actually paid for a worker-month (imported
+ * from ORISSA_SALARY / HOSETL_GIRLS / MONTHLY / mwages statements). The app's
+ * own computation is shown alongside so any difference is visible.
+ */
+export interface PaidSnapshot {
+  src: string;            // register / sheet it came from
+  days: number; rate: number; ot: number;
+  wages: number; otAmt: number; incentive: number; allowance?: number;
+  gross: number;
+  esi: number; pf?: number; adv: number; others: number; mess: number; agent: number;
+  roundOff: number; net: number;
+  pmDiff?: number;
+  /** Agent the worker was under in that month (register AG column). */
+  agentId?: string | null;
+  /** Paid from two registers in the same month — each row as it was paid. */
+  parts?: Omit<PaidSnapshot, "parts">[];
+}
+
+export interface AttendanceRecord {
+  empId: string;
+  month: string;          // YYYY-MM
+  /** Register figures as paid (history months). */
+  paid?: PaidSnapshot;
+  daysWorked: number;
+  saturdaysWorked: number;
+  totalSaturdays: number;
+  absent: number;
+  leave: number;
+  lop: number;
+  otHours: number;
+  weekDaysWorked: number[]; // days worked in each of the 4 weeks
+  halfDays?: number;        // count of half-day marks (the daily report H column)
+  /**
+   * Shift assigned per calendar week-row of the muster (Sun–Sat rows of the
+   * month grid, index 0 = the row containing the 1st). Rotating shifts change
+   * week to week; setting Monday's shift sets the whole row, since that's the
+   * unit HR marks it in. `undefined`/missing index → falls back to the
+   * employee's default shift. Distinct from `weekDaysWorked`'s payroll-week
+   * buckets (which split the month into quarters, not calendar rows).
+   */
+  weekShiftIds?: (string | null)[];
+  /** Day-wage rate for THIS month (rates change over time). Payroll uses it, falling back to the employee's current salaryPerDay. */
+  rate?: number;
+}
+
+/** The date the portal treats as "today" for the AI daily briefing. */
+
+/** Which calendar week-row (Sun–Sat) of `month`'s grid a date falls in. */
+export function weekRowOf(date: string): number {
+  const [y, m, d] = date.split("-").map(Number);
+  const firstDow = new Date(y, m - 1, 1).getDay();
+  return Math.floor((firstDow + d - 1) / 7);
+}
+
+/** The calendar week-row TODAY falls in — the row the attendance table edits by default. */
+export const CURRENT_WEEK_ROW = weekRowOf(TODAY);
+
+/**
+ * OT edit lock: any user may edit OT within the current week (7 days of the
+ * operational date); once that week has passed only Admin/CEO can change it.
+ */
+export const CAN_EDIT_LOCKED_OT_ROLES: HrRole[] = [...HR_ROLES];
+export function canEditOt(role?: HrRole): boolean {
+  // Edit access opened to every login: any signed-in role may edit OT anytime.
+  return !!role;
+}
+
+/** Status for a single employee-day in the attendance register. */
+/**
+ * One day's mark. "Half Day" counts as 0.5 of a working day for pay and for the
+ * daily report's H column — the mill marks it when a worker leaves mid-shift.
+ */
+export type AttendanceStatus = "Present" | "Half Day" | "Absent" | "Leave" | "Holiday";
+
+/** Fraction of a working day each mark contributes to days-worked. */
+export const DAY_CREDIT: Record<AttendanceStatus, number> = {
+  Present: 1, "Half Day": 0.5, Absent: 0, Leave: 0, Holiday: 0,
+};
+
+/** One employee-day punch record — the source of truth for the monthly summary. */
+export interface DailyAttendance {
+  empId: string;
+  date: string;          // YYYY-MM-DD
+  status: AttendanceStatus;
+  /** Muster shift mark when present: D/H/F/G (8h) or X/Y (12h). Drives pay days. */
+  shift?: string;
+  otHours?: number;
+  /**
+   * Worked-unit for this day ONLY when it differs from the employee's permanent
+   * master unit (a shuffle to cover absences). Absent/empty = worked their own
+   * unit. This never changes `employee.unit` — the Unit-1 / Unit-2 master lists
+   * stay fixed; this is a per-day override for attendance reporting only.
+   */
+  unit?: string;
+  source: "import" | "manual";
+}
+
+/** Effective unit an employee worked on a date: the day's shuffle override if set, else their master unit. */
+export function workedUnitFor(daily: DailyAttendance[], empId: string, date: string, masterUnit?: string): string {
+  const d = daily.find((x) => x.empId === empId && x.date === date);
+  return (d?.unit && d.unit.trim()) || masterUnit || "";
+}
+
+/**
+ * A dated joining / re-joining / exit event. The on-roll daily report is built
+ * from these: Closing = Opening + New Join + Re-join − Left, per category and
+ * unit. Logged automatically whenever an employee is added or their status
+ * changes to/from Exited, so the movement ledger can't drift from the master.
+ */
+export type MovementType = "New Join" | "Re-join" | "Left";
+
+export interface Movement {
+  id: string;
+  empId: string;
+  empName: string;
+  type: MovementType;
+  date: string;              // YYYY-MM-DD
+  unit?: string;
+  category: HrEmployee["category"];
+  department?: string;
+  note?: string;
+  by?: string;
+}
+
+/** Salary advance with a monthly recovery plan (deducted from pay). */
+export interface Advance {
+  id: string;
+  empId: string;
+  empName: string;
+  date: string;
+  amount: number;
+  reason: string;
+  monthlyRecovery: number;
+  recovered: number;      // cumulative recovered
+  status: "Active" | "Cleared";
+}
+
+/** Per-month mess bill & other deductions for a worker. */
+export interface MonthlyDeduction {
+  empId: string;
+  month: string;
+  mess: number;
+  others: number;
+  othersNote: string;
+  adv?: number;     // advance recovered that month (register ADV column)
+  pmDiff?: number;  // previous-month round-off carried (hostel register PM DIF)
+}
+
+/** An audit-trail entry — who changed what, and when. */
+export interface AuditEntry {
+  id: string;
+  at: string;
+  by: string;       // "Name (Role)" of the logged-in user
+  module: string;   // e.g. "Advances", "Appraisals"
+  action: string;   // short verb phrase
+  detail: string;   // human-readable specifics
+  empId?: string;   // affected employee, if any
+}
+
+/** A soft-deleted record held in the recycle bin until restored or purged. */
+export interface RecycleEntry {
+  id: string;                              // bin entry id
+  type: "employee" | "advance" | "leave"; // source collection
+  label: string;                           // display title
+  sub?: string;                            // secondary line
+  data: unknown;                           // the original record, for restore
+  deletedBy: string;                       // "Name (Role)"
+  deletedAt: string;
+}
+
+/** Roles allowed to permanently delete (purge) from the recycle bin. */
+export const CAN_PURGE_ROLES: HrRole[] = ["CEO", "Admin", "Super Admin"];
+export const canPurge = (role?: HrRole) => !!role && CAN_PURGE_ROLES.includes(role);
+
+/** A finalised performance appraisal for an employee in a cycle. */
+export interface AppraisalRecord {
+  empId: string;
+  cycle: string;
+  productivity: number;
+  quality: number;
+  attendance: number;
+  discipline: number;
+  teamwork: number;
+  overall: number;
+  incrementPct: number;
+  note: string;
+  study?: string;   // extra study / observation remark from the reviewer
+  finalizedOn: string;
+}
+
+// Demo leave removed for go-live — real leave is recorded in the app / imported.
+const SEED_LEAVE: LeaveRequest[] = [];
+
+// Unique across reloads and machines (a per-load counter repeated earlier ids
+// and broke DB saves): time + counter + random, ≤ 16 chars with a 4-char prefix.
+let seq = 0;
+const uid = (p: string) =>
+  `${p}${Date.now().toString(36)}${(seq++ % 1296).toString(36).padStart(2, "0")}${Math.random().toString(36).slice(2, 4).padEnd(2, "0")}`;
+const nowStr = () => new Date().toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+/** Prepend an audit entry (capturing the current login) to the trail. */
+function withAudit(s: { user: HrUser | null; audit: AuditEntry[] }, module: string, action: string, detail: string, empId?: string): AuditEntry[] {
+  const by = s.user ? `${s.user.name} · ${s.user.loginId} (${s.user.role})` : "System";
+  return [{ id: uid("AUD-"), at: nowStr(), by, module, action, detail, empId }, ...s.audit].slice(0, 800);
+}
+
+// July 2026 has 4 Saturdays (4th, 11th, 18th, 25th).
+const TOTAL_SATURDAYS = 4;
+
+/** Deterministic July-2026 attendance seed, shaped by each worker's conduct. */
+function seedAttendance(): AttendanceRecord[] {
+  return HR_EMPLOYEES.map((e) => {
+    let daysWorked: number, saturdaysWorked: number, absent: number, otHours: number;
+    switch (e.conduct) {
+      case "Absconded": daysWorked = 8; saturdaysWorked = 1; absent = 19; otHours = 0; break;
+      case "Long Leave": daysWorked = 12; saturdaysWorked = 1; absent = 15; otHours = 0; break;
+      case "Frequent Absent": daysWorked = 21; saturdaysWorked = 2; absent = 6; otHours = 2; break;
+      case "Exited": daysWorked = 6; saturdaysWorked = 0; absent = 21; otHours = 0; break;
+      default: // Proper
+        daysWorked = e.wageType === "Daily" ? 28 : 27;
+        saturdaysWorked = 4; absent = 0; otHours = e.wageType === "Daily" ? 10 : 0;
+    }
+    // A couple of proper workers just miss a Saturday, to show partial Inc-1.
+    if (["EMP-1005", "EMP-1007"].includes(e.id)) { saturdaysWorked = 3; daysWorked = 26; }
+    // Split the month's days across 4 weeks (max 7 each).
+    const weekDaysWorked = splitWeeks(daysWorked);
+    return {
+      empId: e.id, month: CURRENT_MONTH, daysWorked, saturdaysWorked,
+      totalSaturdays: TOTAL_SATURDAYS, absent, leave: e.leave.lopThisMonth, lop: e.leave.lopThisMonth, otHours,
+      weekDaysWorked,
+    };
+  });
+}
+
+/** Distribute total days worked across 4 weeks (≤7/week). */
+function splitWeeks(total: number): number[] {
+  const w = [0, 0, 0, 0];
+  let left = total;
+  for (let i = 0; i < 4 && left > 0; i++) { w[i] = Math.min(7, left); left -= w[i]; }
+  return w;
+}
+
+const isSaturdayDate = (date: string) => new Date(`${date}T00:00:00`).getDay() === 6;
+
+/**
+ * Rebuilds the monthly AttendanceRecord for one employee from the day-level
+ * register. Returns null when the employee has no day records for the month —
+ * callers then leave the existing monthly summary untouched.
+ */
+function summaryFromDaily(daily: DailyAttendance[], empId: string, month: string = CURRENT_MONTH, scheme: WageScheme = "odisha"): AttendanceRecord | null {
+  const days = daily.filter((d) => d.empId === empId && d.date.startsWith(month));
+  if (days.length === 0) return null;
+  // Odisha register pays on the 12-hour basis from shift marks (see payDaysFromMarks).
+  const odishaPay = scheme === "odisha"
+    ? payDaysFromMarks(days.map((d) => ({ shift: DAY_CREDIT[d.status] ? (d.shift || "G") : "", ot: d.otHours })), "odisha")
+    : null;
+  let daysWorked = 0, saturdaysWorked = 0, absent = 0, leaveCount = 0, otHours = 0;
+  const weekDaysWorked = [0, 0, 0, 0];
+  let halfDays = 0;
+  for (const d of days) {
+    const credit = DAY_CREDIT[d.status] ?? 0;
+    if (credit > 0) {
+      daysWorked += credit;
+      otHours += d.otHours ?? 0;
+      // A half day still counts as the Saturday having been worked.
+      if (isSaturdayDate(d.date)) saturdaysWorked += 1;
+      weekDaysWorked[Math.min(3, Math.floor((Number(d.date.slice(8, 10)) - 1) / 7))] += credit;
+    } else if (d.status === "Absent") {
+      absent += 1;
+    } else if (d.status === "Leave") {
+      leaveCount += 1;
+    }
+    if (d.status === "Half Day") halfDays += 1;
+  }
+  // Keep the stored figures to one decimal — half days make these fractional.
+  const r1 = (n: number) => Math.round(n * 10) / 10;
+  return {
+    empId, month, daysWorked: odishaPay ? odishaPay.days : r1(daysWorked), saturdaysWorked,
+    totalSaturdays: TOTAL_SATURDAYS, absent, leave: leaveCount, lop: leaveCount, otHours: odishaPay ? odishaPay.ot : otHours,
+    weekDaysWorked: weekDaysWorked.map(r1), halfDays,
+  };
+}
+
+/** Merges a recomputed monthly summary back into the attendance list. A month
+ *  paid from the salary register keeps the register's figures. */
+function upsertSummary(list: AttendanceRecord[], sum: AttendanceRecord): AttendanceRecord[] {
+  const i = list.findIndex((a) => a.empId === sum.empId && a.month === sum.month);
+  if (i >= 0) {
+    if (list[i].paid) return list;
+    const next = [...list]; next[i] = { ...next[i], ...sum }; return next;
+  }
+  return [...list, sum];
+}
+
+/** Re-derive the month a day mark belongs to, priced by the worker's register. */
+function rollup(s: { employees: HrEmployee[]; attendance: AttendanceRecord[] }, daily: DailyAttendance[], empId: string, date: string): AttendanceRecord[] {
+  const month = date.slice(0, 7);
+  const scheme = wageSchemeFor(s.employees.find((e) => e.id === empId)?.category);
+  const sum = summaryFromDaily(daily, empId, month, scheme);
+  if (sum) return upsertSummary(s.attendance, sum);
+  // last mark of the month removed → zero the (unpaid) month
+  return s.attendance.map((a) => (a.empId === empId && a.month === month && !a.paid
+    ? { ...a, daysWorked: 0, saturdaysWorked: 0, absent: 0, leave: 0, lop: 0, otHours: 0, weekDaysWorked: [0, 0, 0, 0] }
+    : a));
+}
+
+/** Mess bills for hostel/Odisha residents; others start at zero. */
+function seedDeductions(): MonthlyDeduction[] {
+  return HR_EMPLOYEES.filter((e) => ["HOSTEL_BOYS", "HOSTEL_GIRLS", "ODISHA"].includes(e.category)).map((e) => ({
+    empId: e.id, month: CURRENT_MONTH, mess: 2500, others: 0, othersNote: "",
+  }));
+}
+
+// Demo advances removed for go-live.
+const SEED_ADVANCES: Advance[] = [];
+
+interface HrState {
+  user: HrUser | null;
+  employees: HrEmployee[];
+  leave: LeaveRequest[];
+  payslipLog: PayslipSend[];
+  transfers: TransferBatch[];
+  attendance: AttendanceRecord[];
+  dailyAttendance: DailyAttendance[];
+  advances: Advance[];
+  deductions: MonthlyDeduction[];
+  weeklyPaid: string[]; // keys: `${empId}|${month}|W${weekIdx}`
+  appraisals: AppraisalRecord[];
+  audit: AuditEntry[];
+  recycleBin: RecycleEntry[];
+  hrUsers: HrUserAccount[];
+  units: string[];
+  dataLock: DataLock;
+  movements: Movement[];
+  customCategories: WorkerCategory[];
+  departments: string[];
+  customAgents: Agent[];
+  reports: CustomReport[];
+
+  login: (u: HrUser) => void;
+  setDataLock: (locked: boolean, note?: string) => { ok: true } | { ok: false; error: string };
+  addMovement: (m: Omit<Movement, "id" | "by">) => void;
+  /** Rebuild the on-roll movement ledger from the current employee master (DOJ → New Join, Exited → Left). */
+  rebuildMovements: () => void;
+  markLeft: (empId: string, exit: Omit<ExitRecord, "recordedBy" | "recordedAt">) => { ok: true } | { ok: false; error: string };
+  markRejoin: (empId: string, rejoin: { rejoinDate: string; note?: string }) => { ok: true } | { ok: false; error: string };
+  updateExit: (empId: string, patch: Partial<ExitRecord>) => { ok: true } | { ok: false; error: string };
+  addCategory: (c: Omit<WorkerCategory, "id"> & { id?: string }) => { ok: true } | { ok: false; error: string };
+  addDepartment: (name: string) => { ok: true } | { ok: false; error: string };
+  addAgent: (a: Omit<Agent, "id" | "active"> & { id?: string; active?: boolean }) => { ok: true } | { ok: false; error: string };
+  updateAgent: (id: string, patch: Partial<Omit<Agent, "id">>) => void;
+  saveReport: (r: Omit<CustomReport, "id" | "createdAt" | "createdBy"> & { id?: string }) => { ok: true } | { ok: false; error: string };
+  deleteReport: (id: string) => void;
+  logout: () => void;
+  addHrUser: (a: { loginId: string; password: string; name: string; role: HrRole }) => { ok: true } | { ok: false; error: string };
+  updateHrUser: (id: string, patch: Partial<Pick<HrUserAccount, "name" | "role" | "loginId" | "active">>) => { ok: true } | { ok: false; error: string };
+  resetHrUserPassword: (id: string, newPassword: string) => void;
+  deleteHrUser: (id: string) => { ok: true } | { ok: false; error: string };
+  updateEmployee: (id: string, patch: Partial<HrEmployee>) => void;
+  importEmployees: (emps: HrEmployee[]) => { added: number; updated: number };
+  addUnit: (name: string) => { ok: true } | { ok: false; error: string };
+  renameUnit: (oldName: string, newName: string) => { ok: true } | { ok: false; error: string };
+  updateHealth: (id: string, patch: Partial<HrEmployee["health"]>) => void;
+  setConduct: (id: string, conduct: HrEmployee["conduct"]) => void;
+  setSalaryStatus: (id: string, status: NonNullable<HrEmployee["salaryStatus"]>, reason?: string) => void;
+  setAttendance: (empId: string, patch: Partial<AttendanceRecord>, month?: string) => void;
+  setWeekShift: (empId: string, weekRow: number, shiftId: string) => void;
+  applyDailyAttendance: (records: DailyAttendance[]) => void;
+  markAttendanceDay: (empId: string, date: string, status: AttendanceStatus, otHours?: number, shift?: string) => void;
+  clearAttendanceDay: (empId: string, date: string) => void;
+  /** Shuffle an employee to another unit for one day (attendance only; master unit unchanged). Empty string clears the override. */
+  setAttendanceDayUnit: (empId: string, date: string, unit: string) => void;
+  addAdvance: (a: Omit<Advance, "id" | "recovered" | "status">) => void;
+  recoverAdvance: (id: string, amount: number) => void;
+  editAdvance: (id: string, patch: Partial<Pick<Advance, "amount" | "monthlyRecovery" | "reason">>) => void;
+  reverseAdvance: (id: string, amount?: number) => void;
+  setDeduction: (empId: string, patch: Partial<Omit<MonthlyDeduction, "empId" | "month">>, month?: string) => void;
+  markWeeklyPaid: (empId: string, weekIdx: number, paid: boolean) => void;
+  setAppraisal: (rec: AppraisalRecord) => void;
+  applyLeave: (l: Omit<LeaveRequest, "id" | "appliedOn" | "status">) => void;
+  advanceLeave: (id: string, decision: "approve" | "reject", by: HrRole) => void;
+  logPayslip: (s: Omit<PayslipSend, "id" | "at">) => void;
+  addTransfer: (t: Omit<TransferBatch, "id" | "at">) => void;
+  setTransferStatus: (id: string, status: TransferBatch["status"]) => void;
+  logAudit: (module: string, action: string, detail: string, empId?: string) => void;
+  deleteEmployee: (id: string) => void;
+  deleteAdvance: (id: string) => void;
+  deleteLeave: (id: string) => void;
+  restoreFromBin: (binId: string) => void;
+  purgeFromBin: (binId: string) => void;
+  reset: () => void;
+}
+
+/**
+ * Bootstrap the movement ledger from what the master already knows: every
+ * employee's date of joining is a "New Join", and anyone already Exited gets a
+ * "Left" on their last recorded day. From go-live onwards the ledger grows from
+ * real events instead.
+ */
+function seedMovements(): Movement[] {
+  const out: Movement[] = [];
+  let n = 1;
+  for (const e of HR_EMPLOYEES) {
+    if (e.doj) {
+      out.push({ id: `MOV-${n++}`, empId: e.id, empName: e.name, type: "New Join", date: e.doj,
+        unit: e.unit ?? seedUnitFor(e.id), category: e.category, department: e.department, by: "System (from DOJ)" });
+    }
+    if (e.status === "Exited") {
+      out.push({ id: `MOV-${n++}`, empId: e.id, empName: e.name, type: "Left", date: TODAY,
+        unit: e.unit ?? seedUnitFor(e.id), category: e.category, department: e.department, by: "System (status = Exited)" });
+    }
+  }
+  return out;
+}
+
+const seed = () => ({
+  employees: HR_EMPLOYEES.map((e) => {
+    const withUnit = { ...e, unit: e.unit ?? seedUnitFor(e.id), training: e.training ?? seedTrainingFor(e.id, e.department) };
+    if (e.id === "EMP-1004") return { ...withUnit, salaryStatus: "On Hold" as const, salaryStatusReason: "Absconded — final settlement pending" };
+    if (e.id === "EMP-1010") return { ...withUnit, salaryStatus: "Pending" as const, salaryStatusReason: "Attendance shortfall — verifying days worked" };
+    if (e.id === "EMP-0733") return { ...withUnit, salaryStatus: "Pending" as const, salaryStatusReason: "Bank account not yet submitted" };
+    return withUnit;
+  }),
+  leave: [...SEED_LEAVE],
+  payslipLog: [] as PayslipSend[],
+  transfers: [] as TransferBatch[],
+  attendance: seedAttendance(),
+  dailyAttendance: [] as DailyAttendance[],
+  advances: [...SEED_ADVANCES],
+  deductions: seedDeductions(),
+  weeklyPaid: [] as string[],
+  appraisals: [] as AppraisalRecord[],
+  audit: [] as AuditEntry[],
+  recycleBin: [] as RecycleEntry[],
+  hrUsers: [...SEED_HR_USERS],
+  units: [...SEED_UNITS],
+  dataLock: { locked: false } as DataLock,
+  movements: seedMovements(),
+  customCategories: [] as WorkerCategory[],
+  departments: [] as string[],
+  customAgents: [] as Agent[],
+  reports: [] as CustomReport[],
+});
+
+export const useHr = create<HrState>()(
+  persist(
+    (set, get) => ({
+      user: null,
+      ...seed(),
+
+      login: (u) => set({ user: u }),
+      logout: () => set({ user: null }),
+
+      setDataLock: (locked, note) => {
+        const role = get().user?.role;
+        if (!canLockData(role)) return { ok: false, error: "Only Admin, CEO or Super Admin can lock or re-open the data." };
+        // Re-opening locked data is the riskier direction — Admin fed it, but only
+        // CEO / Super Admin may unfreeze figures that already back a filing.
+        if (!locked && get().dataLock.locked && !CAN_EDIT_LOCKED_ROLES.includes(role!)) {
+          return { ok: false, error: "Data is locked — only CEO or Super Admin can re-open it for editing." };
+        }
+        set((s) => ({
+          dataLock: { locked, at: nowStr(), by: s.user ? `${s.user.name} (${s.user.role})` : "System", note },
+          audit: withAudit(s, "Data Lock", locked ? "Locked master data" : "Re-opened master data", note ?? (locked ? "Go-live: data verified and frozen" : "Re-opened for correction")),
+        }));
+        return { ok: true };
+      },
+
+      addHrUser: ({ loginId, password, name, role }) => {
+        const trimmed = loginId.trim();
+        if (!trimmed || !password || !name.trim()) return { ok: false, error: "Login ID, password and name are all required." };
+        if (get().hrUsers.some((u) => u.loginId.toLowerCase() === trimmed.toLowerCase())) return { ok: false, error: "That login ID is already in use." };
+        set((s) => ({
+          hrUsers: [...s.hrUsers, { id: uid("USR-"), loginId: trimmed, password, name: name.trim(), role, active: true, createdAt: nowStr(), createdBy: s.user ? `${s.user.name} (${s.user.role})` : "System" }],
+          audit: withAudit(s, "Users & Access", "Created login", `${trimmed} — ${name.trim()} (${role})`),
+        }));
+        return { ok: true };
+      },
+
+      updateHrUser: (id, patch) => {
+        if (patch.loginId) {
+          const trimmed = patch.loginId.trim();
+          if (!trimmed) return { ok: false, error: "Login ID can't be empty." };
+          if (get().hrUsers.some((u) => u.id !== id && u.loginId.toLowerCase() === trimmed.toLowerCase())) return { ok: false, error: "That login ID is already in use." };
+        }
+        const target = get().hrUsers.find((u) => u.id === id);
+        if (!target) return { ok: false, error: "Account not found." };
+        if (patch.active === false && target.role === "Admin" && get().hrUsers.filter((u) => u.role === "Admin" && u.active).length <= 1) {
+          return { ok: false, error: "Can't deactivate the last active Admin account." };
+        }
+        set((s) => ({
+          hrUsers: s.hrUsers.map((u) => (u.id === id ? { ...u, ...patch, loginId: patch.loginId?.trim() ?? u.loginId } : u)),
+          audit: withAudit(s, "Users & Access", "Updated login", `${target.loginId}: ${Object.keys(patch).join(", ")}`),
+        }));
+        return { ok: true };
+      },
+
+      resetHrUserPassword: (id, newPassword) =>
+        set((s) => {
+          const target = s.hrUsers.find((u) => u.id === id);
+          return {
+            hrUsers: s.hrUsers.map((u) => (u.id === id ? { ...u, password: newPassword } : u)),
+            audit: withAudit(s, "Users & Access", "Reset password", `${target?.loginId ?? id}`),
+          };
+        }),
+
+      deleteHrUser: (id) => {
+        const target = get().hrUsers.find((u) => u.id === id);
+        if (!target) return { ok: false, error: "Account not found." };
+        if (target.role === "Admin" && get().hrUsers.filter((u) => u.role === "Admin").length <= 1) {
+          return { ok: false, error: "Can't delete the last Admin account." };
+        }
+        if (get().user?.loginId === target.loginId) return { ok: false, error: "Can't delete the account you're signed in as." };
+        set((s) => ({
+          hrUsers: s.hrUsers.filter((u) => u.id !== id),
+          audit: withAudit(s, "Users & Access", "Deleted login", `${target.loginId} — ${target.name} (${target.role})`),
+        }));
+        return { ok: true };
+      },
+
+      updateEmployee: (id, patch) =>
+        set((s) => {
+          const before = s.employees.find((e) => e.id === id);
+          const employees = s.employees.map((e) => (e.id === id ? { ...e, ...patch } : e));
+          const after = employees.find((e) => e.id === id);
+          // A change of status to/from Exited is a movement — log it so the
+          // on-roll report (Opening + New + Re-join − Left = Closing) balances.
+          let movements = s.movements;
+          if (before && after && patch.status && before.status !== after.status) {
+            const type: MovementType | null =
+              after.status === "Exited" ? "Left" : before.status === "Exited" ? "Re-join" : null;
+            if (type) {
+              movements = [...movements, {
+                id: uid("MOV-"), empId: after.id, empName: after.name, type, date: TODAY,
+                unit: after.unit, category: after.category, department: after.department,
+                by: s.user ? `${s.user.name} (${s.user.role})` : "System", note: `Status ${before.status} → ${after.status}`,
+              }];
+            }
+          }
+          return { employees, movements, audit: withAudit(s, "Employees", "Updated employee", `${id}: ${Object.keys(patch).join(", ")}`, id) };
+        }),
+
+      importEmployees: (emps) => {
+        const before = get().employees;
+        const idx = new Map(before.map((e, i) => [e.id, i]));
+        let added = 0, updated = 0;
+        const newIds: string[] = [];
+        const next = [...before];
+        for (const e of emps) {
+          const at = idx.get(e.id);
+          if (at !== undefined) { next[at] = e; updated++; }
+          else { idx.set(e.id, next.length); next.push(e); added++; newIds.push(e.id); }
+        }
+        // Reconcile the units master so any branch named in the sheet becomes a
+        // selectable/filterable unit ("allocation never misses").
+        set((s) => {
+          const known = new Set(s.units.map((u) => u.toLowerCase()));
+          const discovered: string[] = [];
+          for (const e of emps) {
+            const u = (e.unit ?? "").trim();
+            if (u && !known.has(u.toLowerCase())) { known.add(u.toLowerCase()); discovered.push(u); }
+          }
+          const joined = next.filter((e) => newIds.includes(e.id));
+          return {
+            employees: next,
+            units: discovered.length ? [...s.units, ...discovered] : s.units,
+            movements: [...s.movements, ...joined.map((e) => ({
+              id: uid("MOV-"), empId: e.id, empName: e.name, type: "New Join" as MovementType,
+              date: e.doj || TODAY, unit: e.unit, category: e.category, department: e.department,
+              by: s.user ? `${s.user.name} (${s.user.role})` : "System", note: "Bulk import",
+            }))],
+            audit: withAudit(s, "Employees", "Bulk import (Excel)", `${added} added, ${updated} updated (${emps.length} rows)${discovered.length ? `, ${discovered.length} new unit(s)` : ""}`),
+          };
+        });
+        return { added, updated };
+      },
+
+      addMovement: (m) =>
+        set((s) => ({
+          movements: [...s.movements, { ...m, id: uid("MOV-"), by: s.user ? `${s.user.name} (${s.user.role})` : "System" }],
+          audit: withAudit(s, "On-roll", m.type, `${m.empName} (${m.empId}) — ${m.date}${m.unit ? ` · ${m.unit}` : ""}`, m.empId),
+        })),
+
+      rebuildMovements: () =>
+        set((s) => {
+          const out: Movement[] = [];
+          let n = 1;
+          for (const e of s.employees) {
+            if (e.doj) out.push({ id: `MOV-${n++}`, empId: e.id, empName: e.name, type: "New Join", date: e.doj, unit: e.unit ?? seedUnitFor(e.id), category: e.category, department: e.department, by: "System (from DOJ)" });
+            if (e.status === "Exited") out.push({ id: `MOV-${n++}`, empId: e.id, empName: e.name, type: "Left", date: e.exit?.lastWorkingDay ?? TODAY, unit: e.unit ?? seedUnitFor(e.id), category: e.category, department: e.department, by: "System (status = Exited)" });
+          }
+          return { movements: out };
+        }),
+
+      markLeft: (empId, exit) => {
+        const st = get();
+        if (!canManageExits(st.user?.role)) return { ok: false, error: "Only CEO or Super Admin can record an exit." };
+        const e = st.employees.find((x) => x.id === empId);
+        if (!e) return { ok: false, error: "Employee not found." };
+        if (e.status === "Exited") return { ok: false, error: `${e.name} is already marked as left.` };
+        const rec: ExitRecord = {
+          ...exit,
+          agentIdAtExit: exit.agentIdAtExit ?? e.agentId,
+          recordedBy: st.user ? `${st.user.name} (${st.user.role})` : "System",
+          recordedAt: nowStr(),
+        };
+        set((s) => ({
+          employees: s.employees.map((x) => (x.id === empId
+            ? { ...x, status: "Exited" as const, conduct: exit.reason === "Absconded" ? "Absconded" as const : x.conduct, exit: rec }
+            : x)),
+          // The movement ledger is what the on-roll report reconciles against.
+          movements: [...s.movements, {
+            id: uid("MOV-"), empId, empName: e.name, type: "Left" as MovementType, date: exit.exitDate,
+            unit: e.unit, category: e.category, department: e.department,
+            by: s.user ? `${s.user.name} (${s.user.role})` : "System",
+            note: `${exit.reason}${exit.settled ? " · settled" : " · settlement pending"}`,
+          }],
+          audit: withAudit(s, "Employees", "Marked left", `${e.name} (${empId}) — ${exit.reason} on ${exit.exitDate}, ${exit.settled ? "settled" : "settlement pending"}`, empId),
+        }));
+        return { ok: true };
+      },
+
+      markRejoin: (empId, rejoin) => {
+        const st = get();
+        if (!canManageExits(st.user?.role)) return { ok: false, error: "Only CEO or Super Admin can record a re-join." };
+        const e = st.employees.find((x) => x.id === empId);
+        if (!e) return { ok: false, error: "Employee not found." };
+        if (e.status !== "Exited") return { ok: false, error: `${e.name} is not marked as left.` };
+        // An unsettled exit doesn't block a re-join — the UI warns first, and the
+        // settlement stays visible in the exit history.
+        set((s) => ({
+          employees: s.employees.map((x) => (x.id === empId
+            ? {
+                ...x, status: "Active" as const, conduct: "Proper" as const, exit: undefined,
+                rejoins: [...(x.rejoins ?? []), {
+                  rejoinDate: rejoin.rejoinDate, previousExitDate: x.exit?.exitDate, note: rejoin.note,
+                  recordedBy: s.user ? `${s.user.name} (${s.user.role})` : "System", recordedAt: nowStr(),
+                }],
+              }
+            : x)),
+          movements: [...s.movements, {
+            id: uid("MOV-"), empId, empName: e.name, type: "Re-join" as MovementType, date: rejoin.rejoinDate,
+            unit: e.unit, category: e.category, department: e.department,
+            by: s.user ? `${s.user.name} (${s.user.role})` : "System",
+            note: rejoin.note ?? `Re-joined (previously left ${e.exit?.exitDate ?? "—"})`,
+          }],
+          audit: withAudit(s, "Employees", "Marked re-join", `${e.name} (${empId}) — re-joined ${rejoin.rejoinDate}`, empId),
+        }));
+        return { ok: true };
+      },
+
+      updateExit: (empId, patch) => {
+        const st = get();
+        if (!canManageExits(st.user?.role)) return { ok: false, error: "Only CEO or Super Admin can edit an exit record." };
+        const e = st.employees.find((x) => x.id === empId);
+        if (!e?.exit) return { ok: false, error: "No exit record to edit." };
+        set((s) => ({
+          employees: s.employees.map((x) => (x.id === empId && x.exit ? { ...x, exit: { ...x.exit, ...patch } } : x)),
+          audit: withAudit(s, "Employees", "Edited exit record", `${e.name} (${empId}): ${Object.keys(patch).join(", ")}`, empId),
+        }));
+        return { ok: true };
+      },
+
+      addCategory: (c) => {
+        const label = c.label.trim();
+        if (!label) return { ok: false, error: "Category name is required." };
+        const id = (c.id?.trim() || label.toUpperCase().replace(/[^A-Z0-9]+/g, "_")).replace(/^_+|_+$/g, "");
+        if (!id) return { ok: false, error: "Could not derive a code for that name." };
+        if (allCategories().some((x) => x.id === id || x.label.toLowerCase() === label.toLowerCase()))
+          return { ok: false, error: "A category with that name or code already exists." };
+        set((s) => ({
+          customCategories: [...s.customCategories, { ...c, id, label }],
+          audit: withAudit(s, "Masters", "Created worker category", `${label} (${id}) — ${c.wageType}, PF/ESI ${c.statutory ? "yes" : "no"}`),
+        }));
+        return { ok: true };
+      },
+
+      addDepartment: (name) => {
+        const trimmed = name.trim();
+        if (!trimmed) return { ok: false, error: "Department name is required." };
+        if (allDepartments().some((d) => d.toLowerCase() === trimmed.toLowerCase()))
+          return { ok: false, error: "That department already exists." };
+        set((s) => ({
+          departments: [...s.departments, trimmed],
+          audit: withAudit(s, "Masters", "Created department", trimmed),
+        }));
+        return { ok: true };
+      },
+
+      addAgent: (a) => {
+        const name = a.name.trim();
+        if (!name) return { ok: false, error: "Agent name is required." };
+        const id = (a.id?.trim() || `AGT-${name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 6)}`);
+        if (allAgents().some((x) => x.id === id || x.name.toLowerCase() === name.toLowerCase()))
+          return { ok: false, error: "An agent with that name or code already exists." };
+        set((s) => ({
+          customAgents: [...s.customAgents, { id, name, phone: a.phone ?? "", place: a.place ?? "", commissionPerWorker: a.commissionPerWorker ?? 0, active: a.active ?? true }],
+          audit: withAudit(s, "Masters", "Added agent", `${name} (${id}) — ₹${a.commissionPerWorker ?? 0}/day`),
+        }));
+        return { ok: true };
+      },
+
+      updateAgent: (id, patch) =>
+        set((s) => {
+          const base = s.customAgents.find((a) => a.id === id) ?? allAgents().find((a) => a.id === id);
+          if (!base) return {};
+          const next = { ...base, ...patch, id };
+          const has = s.customAgents.some((a) => a.id === id);
+          return {
+            customAgents: has ? s.customAgents.map((a) => (a.id === id ? next : a)) : [...s.customAgents, next],
+            audit: withAudit(s, "Agents & Commission", "Updated agent", `${next.name} (${id}): ${Object.keys(patch).join(", ")}`),
+          };
+        }),
+
+      saveReport: (r) => {
+        const name = r.name.trim();
+        if (!name) return { ok: false, error: "Report name is required." };
+        if (r.fields.length === 0) return { ok: false, error: "Pick at least one column." };
+        if (r.scope !== "all" && r.scopeValues.length === 0) return { ok: false, error: "Pick at least one value for the chosen scope." };
+        set((s) => {
+          const existing = r.id ? s.reports.find((x) => x.id === r.id) : undefined;
+          const rec: CustomReport = {
+            ...r, name, id: existing?.id ?? uid("RPT-"),
+            createdAt: existing?.createdAt ?? nowStr(),
+            createdBy: existing?.createdBy ?? (s.user ? `${s.user.name} (${s.user.role})` : "System"),
+          };
+          return {
+            reports: existing ? s.reports.map((x) => (x.id === rec.id ? rec : x)) : [...s.reports, rec],
+            audit: withAudit(s, "Reports", existing ? "Updated report" : "Created report", `${name} — ${r.fields.length} column(s), scope ${r.scope}`),
+          };
+        });
+        return { ok: true };
+      },
+
+      deleteReport: (id) =>
+        set((s) => {
+          const r = s.reports.find((x) => x.id === id);
+          return { reports: s.reports.filter((x) => x.id !== id), audit: withAudit(s, "Reports", "Deleted report", r?.name ?? id) };
+        }),
+
+      addUnit: (name) => {
+        const trimmed = name.trim();
+        if (!trimmed) return { ok: false, error: "Unit name can't be empty." };
+        if (get().units.some((u) => u.toLowerCase() === trimmed.toLowerCase())) return { ok: false, error: "That unit already exists." };
+        set((s) => ({ units: [...s.units, trimmed], audit: withAudit(s, "Units & Branches", "Created unit", trimmed) }));
+        return { ok: true };
+      },
+
+      renameUnit: (oldName, newName) => {
+        const trimmed = newName.trim();
+        if (!trimmed) return { ok: false, error: "Unit name can't be empty." };
+        if (!get().units.some((u) => u === oldName)) return { ok: false, error: "Unit not found." };
+        if (get().units.some((u) => u.toLowerCase() === trimmed.toLowerCase() && u !== oldName)) return { ok: false, error: "Another unit already has that name." };
+        set((s) => ({
+          units: s.units.map((u) => (u === oldName ? trimmed : u)),
+          employees: s.employees.map((e) => (e.unit === oldName ? { ...e, unit: trimmed } : e)),
+          audit: withAudit(s, "Units & Branches", "Renamed unit", `${oldName} → ${trimmed}`),
+        }));
+        return { ok: true };
+      },
+
+      updateHealth: (id, patch) =>
+        set((s) => ({ employees: s.employees.map((e) => (e.id === id ? { ...e, health: { ...e.health, ...patch } } : e)), audit: withAudit(s, "Health Check", "Updated health record", `${id}: ${Object.keys(patch ?? {}).join(", ")}`, id) })),
+
+      setConduct: (id, conduct) =>
+        set((s) => ({ employees: s.employees.map((e) => (e.id === id ? { ...e, conduct } : e)), audit: withAudit(s, "Agents & Commission", "Set conduct", `${id} → ${conduct}`, id) })),
+
+      setAttendance: (empId, patch, month = CURRENT_MONTH) =>
+        set((s) => {
+          const audit = withAudit(s, "Attendance & Shifts", "Edited attendance", `${empId} (${month}): ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(", ")}`, empId);
+          const exists = s.attendance.some((a) => a.empId === empId && a.month === month);
+          // Correcting days / OT / rate on a register-paid month makes that month
+          // computed from the corrected figures (the audit log keeps the edit).
+          const reprices = "daysWorked" in patch || "otHours" in patch || "rate" in patch;
+          if (exists) {
+            return { attendance: s.attendance.map((a) => (a.empId === empId && a.month === month ? { ...a, ...patch, ...(reprices ? { paid: undefined } : {}) } : a)), audit };
+          }
+          return {
+            attendance: [...s.attendance, { empId, month, daysWorked: 0, saturdaysWorked: 0, totalSaturdays: TOTAL_SATURDAYS, absent: 0, leave: 0, lop: 0, otHours: 0, weekDaysWorked: [0, 0, 0, 0], ...patch }], audit,
+          };
+        }),
+
+      setWeekShift: (empId, weekRow, shiftId) =>
+        set((s) => {
+          const audit = withAudit(s, "Attendance & Shifts", "Set week shift", `${empId}: week row ${weekRow + 1} → ${shiftId}`, empId);
+          const exists = s.attendance.some((a) => a.empId === empId && a.month === CURRENT_MONTH);
+          if (exists) {
+            return {
+              attendance: s.attendance.map((a) => {
+                if (a.empId !== empId || a.month !== CURRENT_MONTH) return a;
+                const weekShiftIds = [...(a.weekShiftIds ?? [])];
+                weekShiftIds[weekRow] = shiftId;
+                return { ...a, weekShiftIds };
+              }),
+              audit,
+            };
+          }
+          const weekShiftIds: (string | null)[] = [];
+          weekShiftIds[weekRow] = shiftId;
+          return {
+            attendance: [...s.attendance, { empId, month: CURRENT_MONTH, daysWorked: 0, saturdaysWorked: 0, totalSaturdays: TOTAL_SATURDAYS, absent: 0, leave: 0, lop: 0, otHours: 0, weekDaysWorked: [0, 0, 0, 0], weekShiftIds }],
+            audit,
+          };
+        }),
+
+      applyDailyAttendance: (records) =>
+        set((s) => {
+          if (records.length === 0) return {};
+          const incoming = new Set(records.map((r) => `${r.empId}|${r.date}`));
+          const kept = s.dailyAttendance.filter((d) => !incoming.has(`${d.empId}|${d.date}`));
+          const merged = [...kept, ...records];
+          const affected = [...new Set(records.map((r) => r.empId))];
+          let attendance = s.attendance;
+          for (const key of new Set(records.map((r) => `${r.empId}|${r.date.slice(0, 7)}`))) {
+            const [empId, month] = key.split("|");
+            attendance = rollup({ employees: s.employees, attendance }, merged, empId, `${month}-01`);
+          }
+          const audit = withAudit(s, "Attendance & Shifts", "Imported daily attendance", `${records.length} day-records for ${affected.length} employees`);
+          return { dailyAttendance: merged, attendance, audit };
+        }),
+
+      markAttendanceDay: (empId, date, status, otHours, shift) =>
+        set((s) => {
+          const prev = s.dailyAttendance.find((d) => d.empId === empId && d.date === date);
+          const merged = [
+            ...s.dailyAttendance.filter((d) => !(d.empId === empId && d.date === date)),
+            // Preserve any shuffle (unit override), OT and shift already set for this day.
+            {
+              empId, date, status, otHours: otHours ?? prev?.otHours, unit: prev?.unit, source: "manual" as const,
+              shift: status === "Present" ? (shift ?? prev?.shift) : undefined,
+            },
+          ];
+          const attendance = rollup(s, merged, empId, date);
+          const audit = withAudit(s, "Attendance & Shifts", "Marked attendance", `${empId} · ${date} → ${shift ? `${shift} (${status})` : status}`, empId);
+          return { dailyAttendance: merged, attendance, audit };
+        }),
+
+      setAttendanceDayUnit: (empId, date, unit) =>
+        set((s) => {
+          const u = unit.trim();
+          const prev = s.dailyAttendance.find((d) => d.empId === empId && d.date === date);
+          const rest = s.dailyAttendance.filter((d) => !(d.empId === empId && d.date === date));
+          // Keep an existing day mark; a bare shuffle with no mark records the day as Present in the new unit.
+          const rec: DailyAttendance = prev
+            ? { ...prev, unit: u || undefined }
+            : { empId, date, status: "Present", unit: u || undefined, source: "manual" };
+          const merged = u || prev ? [...rest, rec] : rest;
+          const audit = withAudit(s, "Attendance & Shifts", "Unit shuffle", `${empId} · ${date} → ${u || "own unit"} (master unchanged)`, empId);
+          return { dailyAttendance: merged, audit };
+        }),
+
+      clearAttendanceDay: (empId, date) =>
+        set((s) => {
+          const merged = s.dailyAttendance.filter((d) => !(d.empId === empId && d.date === date));
+          const attendance = rollup(s, merged, empId, date);
+          const audit = withAudit(s, "Attendance & Shifts", "Cleared attendance", `${empId} · ${date}`, empId);
+          return { dailyAttendance: merged, attendance, audit };
+        }),
+
+      addAdvance: (a) =>
+        set((s) => ({ advances: [{ ...a, id: uid("ADV-"), recovered: 0, status: "Active" }, ...s.advances], audit: withAudit(s, "Advances", "Booked advance", `${a.empName}: ₹${a.amount} @ ₹${a.monthlyRecovery}/mo`, a.empId) })),
+
+      recoverAdvance: (id, amount) =>
+        set((s) => ({
+          advances: s.advances.map((a) => {
+            if (a.id !== id) return a;
+            const recovered = Math.min(a.amount, a.recovered + amount);
+            return { ...a, recovered, status: recovered >= a.amount ? ("Cleared" as const) : ("Active" as const) };
+          }),
+          audit: withAudit(s, "Advances", "Recovered instalment", `${id}: ₹${amount}`, s.advances.find((a) => a.id === id)?.empId),
+        })),
+
+      editAdvance: (id, patch) =>
+        set((s) => ({
+          advances: s.advances.map((a) => {
+            if (a.id !== id) return a;
+            const merged = { ...a, ...patch };
+            merged.recovered = Math.min(merged.recovered, merged.amount);
+            merged.status = merged.recovered >= merged.amount ? "Cleared" : "Active";
+            return merged;
+          }),
+          audit: withAudit(s, "Advances", "Edited advance", `${id}: ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(", ")}`, s.advances.find((a) => a.id === id)?.empId),
+        })),
+
+      reverseAdvance: (id, amount) =>
+        set((s) => ({
+          advances: s.advances.map((a) => {
+            if (a.id !== id) return a;
+            const back = amount ?? a.monthlyRecovery; // reverse one instalment by default
+            const recovered = Math.max(0, a.recovered - back);
+            return { ...a, recovered, status: recovered >= a.amount ? ("Cleared" as const) : ("Active" as const) };
+          }),
+          audit: withAudit(s, "Advances", "Reversed instalment", `${id}`, s.advances.find((a) => a.id === id)?.empId),
+        })),
+
+      setSalaryStatus: (id, status, reason) =>
+        set((s) => ({
+          employees: s.employees.map((e) => (e.id === id ? { ...e, salaryStatus: status, salaryStatusReason: status === "Paid" ? undefined : reason } : e)),
+          audit: withAudit(s, "Employees", "Set salary status", `${id} → ${status}${reason ? ` (${reason})` : ""}`, id),
+        })),
+
+      markWeeklyPaid: (empId, weekIdx, paid) =>
+        set((s) => {
+          const key = `${empId}|${CURRENT_MONTH}|W${weekIdx}`;
+          return { weeklyPaid: paid ? [...new Set([...s.weeklyPaid, key])] : s.weeklyPaid.filter((k) => k !== key), audit: withAudit(s, "Weekly Wages", paid ? "Marked week paid" : "Marked week pending", `${empId} · W${weekIdx + 1}`, empId) };
+        }),
+
+      setAppraisal: (rec) =>
+        set((s) => ({
+          appraisals: [rec, ...s.appraisals.filter((a) => !(a.empId === rec.empId && a.cycle === rec.cycle))],
+          audit: withAudit(s, "Appraisals", "Finalized appraisal", `${rec.empId}: overall ${rec.overall}/5, increment ${rec.incrementPct}%`, rec.empId),
+        })),
+
+      setDeduction: (empId, patch, month = CURRENT_MONTH) =>
+        set((s) => {
+          const audit = withAudit(s, "Advances & Deductions", "Edited deduction", `${empId} (${month}): ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(", ")}`, empId);
+          const exists = s.deductions.some((d) => d.empId === empId && d.month === month);
+          if (exists) {
+            return { deductions: s.deductions.map((d) => (d.empId === empId && d.month === month ? { ...d, ...patch } : d)), audit };
+          }
+          return { deductions: [...s.deductions, { empId, month, mess: 0, others: 0, othersNote: "", ...patch }], audit };
+        }),
+
+      applyLeave: (l) =>
+        set((s) => ({
+          leave: [{ ...l, id: uid("LV-"), status: "Pending", appliedOn: TODAY }, ...s.leave],
+          audit: withAudit(s, "Leave", "Applied leave", `${l.empName}: ${l.type} ${l.from}→${l.to}`, l.empId),
+        })),
+
+      advanceLeave: (id, decision, by) => {
+        const before = get().leave.find((l) => l.id === id);
+        set((s) => ({
+          leave: s.leave.map((l) => {
+            if (l.id !== id) return l;
+            if (decision === "reject") return { ...l, status: "Rejected" as const };
+            if (l.status === "Pending" && by === "Manager") return { ...l, status: "Approved by Manager" as const };
+            return { ...l, status: "Approved" as const };
+          }),
+          audit: withAudit(s, "Leave", decision === "reject" ? "Rejected leave" : "Approved leave", `${id} by ${by}`, s.leave.find((l) => l.id === id)?.empId),
+        }));
+        // On final approval: mark each day on the register (LOP = absent, unpaid)
+        // and take paid leave off the balance.
+        const after = get().leave.find((l) => l.id === id);
+        if (!before || before.status === "Approved" || after?.status !== "Approved") return;
+        for (let d = new Date(`${after.from}T00:00:00`); d <= new Date(`${after.to}T00:00:00`); d.setDate(d.getDate() + 1)) {
+          const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+          get().markAttendanceDay(after.empId, iso, after.type === "LOP" ? "Absent" : "Leave");
+        }
+        const key = after.type.toLowerCase() as "el" | "cl" | "sl" | "lop";
+        set((s) => ({
+          employees: s.employees.map((e) => {
+            if (e.id !== after.empId) return e;
+            const bal = e.leave ?? { el: 0, cl: 0, sl: 0, lopThisMonth: 0 };
+            return { ...e, leave: key === "lop"
+              ? { ...bal, lopThisMonth: bal.lopThisMonth + after.days }
+              : { ...bal, [key]: Math.max(0, bal[key] - after.days) } };
+          }),
+        }));
+      },
+
+      logPayslip: (p) => set((s) => ({ payslipLog: [{ ...p, id: uid("PS-"), at: nowStr() }, ...s.payslipLog], audit: withAudit(s, "Payroll", "Sent payslip", `${p.empName} via ${p.channel} (${p.month})`, p.empId) })),
+
+      addTransfer: (t) => set((s) => ({ transfers: [{ ...t, id: uid("BT-"), at: nowStr() }, ...s.transfers], audit: withAudit(s, "Bank Transfer", "Created batch", `${t.month}: ${t.count} beneficiaries, ₹${t.total}`) })),
+      setTransferStatus: (id, status) => set((s) => ({ transfers: s.transfers.map((t) => (t.id === id ? { ...t, status } : t)), audit: withAudit(s, "Bank Transfer", "Batch status", `${id} → ${status}`) })),
+
+      logAudit: (module, action, detail, empId) => set((s) => ({ audit: withAudit(s, module, action, detail, empId) })),
+
+      deleteEmployee: (id) =>
+        set((s) => {
+          const e = s.employees.find((x) => x.id === id);
+          if (!e) return {};
+          const entry: RecycleEntry = { id: uid("BIN-"), type: "employee", label: e.name, sub: `${id} · ${e.role}`, data: e, deletedBy: s.user ? `${s.user.name} (${s.user.role})` : "System", deletedAt: nowStr() };
+          return { employees: s.employees.filter((x) => x.id !== id), recycleBin: [entry, ...s.recycleBin], audit: withAudit(s, "Employees", "Deleted employee", `${e.name} (${id}) → recycle bin`, id) };
+        }),
+
+      deleteAdvance: (id) =>
+        set((s) => {
+          const a = s.advances.find((x) => x.id === id);
+          if (!a) return {};
+          const entry: RecycleEntry = { id: uid("BIN-"), type: "advance", label: `${a.empName} — ₹${a.amount}`, sub: `${a.reason} · ${a.date}`, data: a, deletedBy: s.user ? `${s.user.name} (${s.user.role})` : "System", deletedAt: nowStr() };
+          return { advances: s.advances.filter((x) => x.id !== id), recycleBin: [entry, ...s.recycleBin], audit: withAudit(s, "Advances", "Deleted advance", `${id} → recycle bin`, a.empId) };
+        }),
+
+      deleteLeave: (id) =>
+        set((s) => {
+          const l = s.leave.find((x) => x.id === id);
+          if (!l) return {};
+          const entry: RecycleEntry = { id: uid("BIN-"), type: "leave", label: `${l.empName} — ${l.type}`, sub: `${l.from} → ${l.to}`, data: l, deletedBy: s.user ? `${s.user.name} (${s.user.role})` : "System", deletedAt: nowStr() };
+          return { leave: s.leave.filter((x) => x.id !== id), recycleBin: [entry, ...s.recycleBin], audit: withAudit(s, "Leave", "Deleted leave", `${id} → recycle bin`, l.empId) };
+        }),
+
+      restoreFromBin: (binId) =>
+        set((s) => {
+          const entry = s.recycleBin.find((x) => x.id === binId);
+          if (!entry) return {};
+          const rest = s.recycleBin.filter((x) => x.id !== binId);
+          const audit = withAudit(s, "Recycle Bin", "Restored", `${entry.type}: ${entry.label}`);
+          if (entry.type === "employee") return { employees: [...s.employees, entry.data as HrEmployee], recycleBin: rest, audit };
+          if (entry.type === "advance") return { advances: [entry.data as Advance, ...s.advances], recycleBin: rest, audit };
+          return { leave: [entry.data as LeaveRequest, ...s.leave], recycleBin: rest, audit };
+        }),
+
+      purgeFromBin: (binId) =>
+        set((s) => {
+          if (!canPurge(s.user?.role)) return {}; // only CEO / Admin may permanently delete
+          const entry = s.recycleBin.find((x) => x.id === binId);
+          if (!entry) return {};
+          return { recycleBin: s.recycleBin.filter((x) => x.id !== binId), audit: withAudit(s, "Recycle Bin", "Permanently deleted", `${entry.type}: ${entry.label}`) };
+        }),
+
+      reset: () => set(seed()),
+    }),
+    {
+      name: "mehala-erp-hr-v4",
+      version: 3,
+      // v0 → v1: company units — backfill a branch on every employee.
+      // v1 → v2: cross-skill training — backfill so the redeployment AI has data,
+      //          and introduce the go-live data lock (defaults to unlocked).
+      // v2 → v3: go-live — purge all demo/dummy data cached in the browser so
+      //          clients start empty; the real roster is imported from Excel.
+      migrate: (persisted, _version) => {
+        const st = persisted as Partial<HrState> | undefined;
+        if (!st) return st as unknown as HrState;
+        if (_version < 3) {
+          st.employees = []; st.attendance = []; st.dailyAttendance = [];
+          st.advances = []; st.deductions = []; st.leave = [];
+          st.movements = []; st.weeklyPaid = []; st.appraisals = [];
+          st.payslipLog = []; st.transfers = []; st.audit = []; st.recycleBin = [];
+        }
+        if (!Array.isArray(st.units) || st.units.length === 0) st.units = [...SEED_UNITS];
+        if (!st.dataLock) st.dataLock = { locked: false };
+        if (Array.isArray(st.employees)) st.employees = st.employees.map((e) => ({
+          ...e,
+          unit: e.unit ?? seedUnitFor(e.id),
+          training: e.training ?? seedTrainingFor(e.id, e.department),
+        }));
+        return st as HrState;
+      },
+    }
+  )
+);
+
+/**
+ * The one hook every screen uses to decide whether to render its edit / delete
+ * controls. Before go-live (unlocked) Admin & HR Manager can edit everything;
+ * after Admin confirms the data, only CEO / Super Admin can.
+ */
+export function useCanEdit(): boolean {
+  const role = useHr((s) => s.user?.role);
+  const locked = useHr((s) => s.dataLock.locked);
+  return canEditData(role, locked);
+}
+
+/** True once the master data has been confirmed and frozen for go-live. */
+export function useDataLocked(): boolean {
+  return useHr((s) => s.dataLock.locked);
+}
+
+export function leaveStatusTone(status: LeaveRequest["status"]): "success" | "warning" | "danger" | "info" {
+  if (status === "Approved") return "success";
+  if (status === "Rejected") return "danger";
+  if (status === "Approved by Manager") return "info";
+  return "warning";
+}
+
+// ---- Selectors -------------------------------------------------------------
+
+export function attendanceFor(list: AttendanceRecord[], empId: string, month: string = CURRENT_MONTH): AttendanceRecord | undefined {
+  return list.find((a) => a.empId === empId && a.month === month);
+}
+
+/** On that month's roll: still employed, or left but has attendance that month. */
+export function onRollIn(e: { id: string; status: string }, list: AttendanceRecord[], month: string): boolean {
+  return e.status !== "Exited" || !!attendanceFor(list, e.id, month);
+}
+
+/** The shift for a given calendar week-row — falls back to the employee's default shift if that week has no override. */
+export function shiftForWeek(list: AttendanceRecord[], empId: string, weekRow: number, defaultShiftId: string): string {
+  return attendanceFor(list, empId)?.weekShiftIds?.[weekRow] || defaultShiftId;
+}
+
+export function dailyFor(list: DailyAttendance[], empId: string, date: string): DailyAttendance | undefined {
+  return list.find((d) => d.empId === empId && d.date === date);
+}
+
+export function attendanceStatusTone(status?: AttendanceStatus): "success" | "danger" | "info" | "warning" | "muted" {
+  if (status === "Present") return "success";
+  if (status === "Absent") return "danger";
+  if (status === "Leave") return "info";
+  if (status === "Holiday") return "warning";
+  return "muted";
+}
+
+export function deductionFor(list: MonthlyDeduction[], empId: string, month: string = CURRENT_MONTH): MonthlyDeduction {
+  return list.find((d) => d.empId === empId && d.month === month) ?? { empId, month, mess: 0, others: 0, othersNote: "" };
+}
+
+/** Distinct attendance months present in the data, newest first (for month pickers). */
+export function availableMonths(list: AttendanceRecord[]): string[] {
+  const set = new Set<string>(list.map((a) => a.month));
+  set.add(CURRENT_MONTH);
+  return [...set].sort((a, b) => b.localeCompare(a));
+}
+export function monthLabel(m: string): string {
+  return new Date(`${m}-01T00:00:00`).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+}
+
+/** Advance recovery to apply this month = min(monthlyRecovery, outstanding). */
+export function advanceRecoveryFor(list: Advance[], empId: string): number {
+  return list
+    .filter((a) => a.empId === empId && a.status === "Active")
+    .reduce((s, a) => s + Math.min(a.monthlyRecovery, a.amount - a.recovered), 0);
+}
+
+export function outstandingAdvance(list: Advance[], empId: string): number {
+  return list
+    .filter((a) => a.empId === empId && a.status === "Active")
+    .reduce((s, a) => s + (a.amount - a.recovered), 0);
+}
+
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+export interface AdvanceProjection {
+  remaining: number;
+  perMonth: number;
+  monthsLeft: number;
+  completeLabel: string; // "Oct 2026" or "Cleared"
+}
+
+/** Projects when an advance finishes at its current monthly recovery rate. */
+export function advanceProjection(a: Advance, fromYM: string = CURRENT_MONTH): AdvanceProjection {
+  const remaining = Math.max(0, a.amount - a.recovered);
+  const perMonth = Math.max(1, a.monthlyRecovery);
+  const monthsLeft = a.status === "Cleared" || remaining === 0 ? 0 : Math.ceil(remaining / perMonth);
+  const [y, m] = fromYM.split("-").map(Number);
+  const idx = y * 12 + (m - 1) + Math.max(0, monthsLeft - 1);
+  const completeLabel = monthsLeft === 0 ? "Cleared" : `${MONTHS_SHORT[idx % 12]} ${Math.floor(idx / 12)}`;
+  return { remaining, perMonth, monthsLeft, completeLabel };
+}
+
+export function weeklyPaidKey(empId: string, weekIdx: number): string {
+  return `${empId}|${CURRENT_MONTH}|W${weekIdx}`;
+}
+export function isWeeklyPaid(list: string[], empId: string, weekIdx: number): boolean {
+  return list.includes(weeklyPaidKey(empId, weekIdx));
+}

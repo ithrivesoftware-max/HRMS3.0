@@ -1,0 +1,458 @@
+"use client";
+
+import { useState } from "react";
+import { PageHeader } from "@/components/page-header";
+import { KpiCard } from "@/components/kpi-card";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Table, THead, TBody, TR, TH, TD } from "@/components/ui/table";
+import { downloadExcel } from "@/lib/excel";
+import { DetailSheet } from "@/components/detail-sheet";
+import { AttendanceImportModal } from "@/components/attendance-import-modal";
+import { AttendanceCalendar } from "@/components/attendance-calendar";
+import { DatePickerModal } from "@/components/date-picker-modal";
+import { SHIFTS, shiftById, categoryById, categoryIdOf, WEEK_LABELS, allCategories } from "@/lib/hr-master";
+import { monthlyIncentive } from "@/lib/mill-wages";
+import { schemeFromSource, wageSchemeFor } from "@/lib/payroll";
+import { formatINR } from "@/lib/utils";
+import { useHr, attendanceFor, onRollIn, dailyFor, workedUnitFor, shiftForWeek, attendanceStatusTone, canEditOt, useCanEdit, availableMonths, monthLabel, TODAY, CURRENT_MONTH, CURRENT_MONTH_LABEL, CURRENT_WEEK_ROW } from "@/stores/hr";
+import { COMPANY } from "@/lib/company";
+import type { HrEmployee } from "@/lib/hr-data";
+import type { AttendanceStatus } from "@/stores/hr";
+import { useToast } from "@/components/ui/toast";
+import { CalendarCheck, Users, TrendingUp, AlertTriangle, FileSpreadsheet, Upload, CalendarDays, Lock, Printer } from "lucide-react";
+
+const selectCls = "h-8 rounded-md border border-input bg-card px-2 text-xs focus:outline-none focus:ring-1 focus:ring-ring";
+
+export default function AttendancePage() {
+  const [q, setQ] = useState("");
+  const [shift, setShift] = useState("All");
+  const [cat, setCat] = useState("All");
+  const [unitF, setUnitF] = useState("All");
+  const [deptF, setDeptF] = useState("All");
+  const [monthSel, setMonthSel] = useState(CURRENT_MONTH);
+  const [detail, setDetail] = useState<HrEmployee | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [calEmp, setCalEmp] = useState<HrEmployee | null>(null);
+  const [viewDate, setViewDate] = useState(TODAY);
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const employees = useHr((s) => s.employees);
+  const attendance = useHr((s) => s.attendance);
+  const dailyAttendance = useHr((s) => s.dailyAttendance);
+  const setAttendance = useHr((s) => s.setAttendance);
+  const setWeekShift = useHr((s) => s.setWeekShift);
+  const applyDailyAttendance = useHr((s) => s.applyDailyAttendance);
+  const markAttendanceDay = useHr((s) => s.markAttendanceDay);
+  const clearAttendanceDay = useHr((s) => s.clearAttendanceDay);
+  const user = useHr((s) => s.user);
+  const units = useHr((s) => s.units);
+  const setAttendanceDayUnit = useHr((s) => s.setAttendanceDayUnit);
+  const departments = [...new Set(employees.map((e) => e.department).filter((d) => d && d !== "—"))].sort();
+  const usedCats = new Set(employees.map((e) => categoryIdOf(e.category)));
+  const mayEdit = useCanEdit();
+  // OT also respects the go-live lock: locked -> CEO/Super Admin only.
+  const otEditable = canEditOt(user?.role) && mayEdit;
+  const toast = useToast((s) => s.push);
+
+  const rows = employees
+    .filter((e) => onRollIn(e, attendance, monthSel))
+    .filter((e) => shift === "All" || e.shiftId === shift)
+    .filter((e) => cat === "All" || categoryIdOf(e.category) === cat)
+    .filter((e) => unitF === "All" || (e.unit ?? "") === unitF)
+    .filter((e) => deptF === "All" || e.department === deptF)
+    .filter((e) => `${e.name} ${e.id} ${e.department}`.toLowerCase().includes(q.toLowerCase()))
+    .map((e) => {
+      const a = attendanceFor(attendance, e.id, monthSel);
+      const daysWorked = a?.daysWorked ?? 0;
+      const weekShiftId = shiftForWeek(attendance, e.id, CURRENT_WEEK_ROW, e.shiftId);
+      const workedUnit = workedUnitFor(dailyAttendance, e.id, viewDate, e.unit);
+      const day = dailyFor(dailyAttendance, e.id, viewDate);
+      return { e, a, daysWorked, otHours: a?.otHours ?? 0, absent: a?.absent ?? 0, weekShiftId, workedUnit, shuffled: !!e.unit && workedUnit !== e.unit, dayStatus: day?.status, dayShift: day?.status === "Present" ? day.shift : undefined, paid: !!a?.paid };
+    });
+
+  const fullAttendance = rows.filter((r) => r.daysWorked >= 28).length;
+  const avgDays = rows.length ? Math.round(rows.reduce((s, r) => s + r.daysWorked, 0) / rows.length) : 0;
+  const lowAttendance = rows.filter((r) => r.daysWorked < 20).length;
+
+  // Label for the single-day status column — updates in place as `viewDate`
+  // changes; the table itself (rows/columns) never changes shape.
+  const viewDateLabel = new Date(`${viewDate}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+  const viewDateFullLabel = new Date(`${viewDate}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+
+  const exportAttendance = () =>
+    downloadExcel({
+      filename: `attendance-${CURRENT_MONTH_LABEL}`, sheetName: "Attendance", title: `Attendance — ${CURRENT_MONTH_LABEL}`,
+      columns: [
+        { header: "Emp ID", key: "id" }, { header: "Name", key: "name", width: 22 }, { header: "Category", key: "category" },
+        { header: "Department", key: "department", width: 16 }, { header: "Unit", key: "unit" },
+        { header: "Shift", key: "shift" }, { header: "Days Worked", key: "daysWorked" },
+        { header: "OT (hr)", key: "otHours" }, { header: "Absent", key: "absent" },
+      ],
+      rows: rows.map((r) => ({
+        id: r.e.id, name: r.e.name, category: categoryById(r.e.category)?.label ?? r.e.category,
+        department: r.e.department, unit: r.e.unit ?? "",
+        shift: shiftById(r.weekShiftId)?.code ?? "", daysWorked: r.daysWorked,
+        otHours: r.otHours, absent: r.absent,
+      })),
+    });
+
+  const num = (v: string) => Math.max(0, Number(v) || 0);
+
+  // Monthly Attendance Register (statutory Form-25 / pre-printed muster): one
+  // column per day (P / A / L / H, Sundays default to W/H, blank = to be filled),
+  // then shift + OT. Respects the current shift/category/search filter so you
+  // can print a section at a time.
+  const STATUS_CODE: Record<string, string> = { Present: "P", "Half Day": "1/2", Absent: "A", Leave: "L", Holiday: "H" };
+  const [y, m] = CURRENT_MONTH.split("-").map(Number);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const monthDays = Array.from({ length: daysInMonth }, (_, i) => i + 1);
+  const exportRegister = () =>
+    downloadExcel({
+      filename: `attendance-register-${CURRENT_MONTH}`,
+      sheetName: "Register",
+      title: `${COMPANY.name} — ATTENDANCE REGISTER — ${CURRENT_MONTH_LABEL} (P=Present · 1/2=Half Day · A=Absent · L=Leave · W/H=Weekly Holiday)`,
+      columns: [
+        { header: "S.No", key: "sno" }, { header: "E.No / Token", key: "token", width: 12 },
+        { header: "Name", key: "name", width: 22 }, { header: "Father's Name", key: "father", width: 18 },
+        { header: "Dept", key: "dept", width: 12 }, { header: "Gr", key: "grade" },
+        ...monthDays.map((d) => ({ header: String(d), key: `d${d}` })),
+        { header: "Days", key: "days" }, { header: "Shift", key: "shift" }, { header: "OT", key: "ot" },
+      ],
+      rows: rows.map((r, i) => {
+        const rec: Record<string, unknown> = {
+          sno: i + 1, token: r.e.tokenNo ?? r.e.id, name: r.e.name, father: r.e.fatherName ?? "",
+          dept: r.e.department, grade: r.e.grade, days: r.daysWorked, shift: shiftById(r.weekShiftId)?.code ?? "", ot: r.otHours,
+        };
+        for (const d of monthDays) {
+          const date = `${CURRENT_MONTH}-${String(d).padStart(2, "0")}`;
+          const st = dailyFor(dailyAttendance, r.e.id, date)?.status;
+          rec[`d${d}`] = st ? STATUS_CODE[st] ?? "" : new Date(y, m - 1, d).getDay() === 0 ? "W/H" : "";
+        }
+        return rec;
+      }),
+    });
+
+  // Printable attendance register (browser print → paper/PDF) in the mill's exact
+  // "ATTENDANCE REGISTER FOR THE MONTH" / Form-25 layout: statutory header, one
+  // column per day headed by date + weekday, W/H pre-marked on Sundays, the rest
+  // blank to fill by hand. Respects the shift/category/unit filter → print a
+  // section at a time (STAFF, HOSTEL, KNIT…).
+  const WD = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+  const printRegister = () => {
+    const esc = (s: unknown) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c] as string));
+    const section = cat !== "All" ? (categoryById(cat as HrEmployee["category"])?.label ?? "") : "";
+    const scope = [unitF !== "All" ? unitF : "", shift !== "All" ? `Shift ${shiftById(shift)?.code}` : ""].filter(Boolean).join(" · ");
+    // Day header: two lines — date number over weekday initial.
+    const dayHead = monthDays.map((d) => `<th class="day"><div>${d}</div><div class="wd">${WD[new Date(y, m - 1, d).getDay()][0]}</div></th>`).join("");
+    const body = rows.map((r, i) => {
+      const cells = monthDays.map((d) => {
+        const date = `${CURRENT_MONTH}-${String(d).padStart(2, "0")}`;
+        const st = dailyFor(dailyAttendance, r.e.id, date)?.status;
+        const v = st ? (STATUS_CODE[st] ?? "") : new Date(y, m - 1, d).getDay() === 0 ? "W/H" : "";
+        return `<td class="day${v === "W/H" ? " wh" : ""}">${v}</td>`;
+      }).join("");
+      return `<tr><td>${i + 1}</td><td>${esc(r.e.tokenNo ?? r.e.id)}</td><td class="nm">${esc(r.e.name)}</td><td class="nm">${esc(r.e.fatherName ?? "")}</td><td>${esc(r.e.department)}</td><td>${esc(r.e.grade)}</td><td>SUN</td>${cells}<td></td><td></td><td></td></tr>`;
+    }).join("");
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Attendance Register — ${esc(CURRENT_MONTH_LABEL)}</title>
+      <style>
+        @page { size: A4 landscape; margin: 6mm; }
+        body { font-family: Arial, sans-serif; color:#000; margin:0; }
+        .co { text-align:center; font-size:13px; font-weight:bold; }
+        .ad { text-align:center; font-size:9px; margin:1px 0; }
+        .ttl { text-align:center; font-size:11px; font-weight:bold; margin:3px 0; text-transform:uppercase; }
+        .meta { display:flex; justify-content:space-between; font-size:10px; margin:2px 2px 6px; }
+        table { border-collapse: collapse; width:100%; table-layout:fixed; }
+        th,td { border:1px solid #333; font-size:8px; padding:1px; text-align:center; overflow:hidden; }
+        th { background:#eee; }
+        td.nm { text-align:left; white-space:nowrap; font-size:8px; }
+        td.day, th.day { width:15px; }
+        th.day .wd { font-size:6px; color:#555; }
+        td.wh { background:#ddd; font-size:7px; }
+        .foot { margin-top:12px; font-size:10px; display:flex; justify-content:space-between; }
+        .leg { font-size:8px; margin:4px 2px; }
+      </style></head><body>
+      <div class="co">${esc(COMPANY.name)}</div>
+      <div class="ad">${esc(COMPANY.address ?? COMPANY.location)}</div>
+      <div class="ttl">Form No. 25 · Attendance Register for the Month — ${esc(CURRENT_MONTH_LABEL)}</div>
+      <div class="meta"><span><b>Section:</b> ${esc(section || "All sections")}${scope ? ` · ${esc(scope)}` : ""}</span><span><b>On-roll:</b> ${rows.length}</span></div>
+      <table>
+        <colgroup><col style="width:22px"><col style="width:34px"><col style="width:90px"><col style="width:80px"><col style="width:34px"><col style="width:18px"><col style="width:26px">${monthDays.map(() => '<col style="width:15px">').join("")}<col style="width:24px"><col style="width:24px"><col style="width:26px"></colgroup>
+        <thead><tr>
+          <th>S.No</th><th>E.No</th><th>Name</th><th>Father's Name</th><th>Dept</th><th>Gr</th><th>W/H</th>${dayHead}<th>P</th><th>OT</th><th>Sign</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+      <div class="leg">Mark: P = Present · &frac12; = Half Day · A = Absent · L = Leave · H = Holiday · W/H = Weekly Holiday (pre-printed). Leave day cells blank to fill by hand.</div>
+      <div class="foot"><span>Prepared by: ______________</span><span>Checked by: ______________</span><span>Authorised: ______________</span></div>
+      <script>window.onload=function(){window.print();}</script></body></html>`;
+    const w = window.open("", "_blank");
+    if (!w) { toast("Pop-up blocked", "Allow pop-ups to print the register."); return; }
+    w.document.write(html);
+    w.document.close();
+  };
+
+  return (
+    <>
+      <PageHeader
+        title="Attendance & Shifts"
+        description={`Monthly attendance for ${monthLabel(monthSel)} — mark each day with the muster code (D/H/F/G 8-hour, X/Y 12-hour, A absent); days worked and OT recalculate and flow straight into payroll.`}
+        actions={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
+              <Upload className="h-4 w-4" /> Import Excel
+            </Button>
+            <Button variant="outline" size="sm" onClick={printRegister}>
+              <Printer className="h-4 w-4" /> Print register
+            </Button>
+            <Button variant="outline" size="sm" onClick={exportRegister}>
+              <FileSpreadsheet className="h-4 w-4" /> Register (Form-25)
+            </Button>
+            <Button variant="outline" size="sm" onClick={exportAttendance}>
+              <FileSpreadsheet className="h-4 w-4" /> Export
+            </Button>
+          </>
+        }
+      />
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <KpiCard label="Workforce" value={`${rows.length}`} icon={Users} sub={`${SHIFTS.length} shifts`} />
+        <KpiCard
+          label="Avg days worked"
+          value={`${avgDays}`}
+          icon={CalendarCheck}
+          sub={`of 28 · ${viewDateFullLabel}`}
+          tone="info"
+          onClick={() => setDatePickerOpen(true)}
+        />
+        <KpiCard label="Full attendance (28+)" value={`${fullAttendance}`} icon={TrendingUp} sub="₹30/day incentive slab (Odisha)" tone="success" />
+        <KpiCard label="Low attendance (<20)" value={`${lowAttendance}`} icon={AlertTriangle} sub="review conduct / agent" tone="danger" />
+      </div>
+
+      <Card>
+        <CardContent className="py-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Button variant={shift === "All" ? "default" : "outline"} size="sm" className="h-7 px-2.5 text-[11px]" onClick={() => setShift("All")}>All shifts</Button>
+              {SHIFTS.map((s) => (
+                <Button key={s.id} variant={shift === s.id ? "default" : "outline"} size="sm" className="h-7 px-2.5 text-[11px]" onClick={() => setShift(s.id)} title={s.time}>{s.code} · {s.name}</Button>
+              ))}
+              <select value={cat} onChange={(e) => setCat(e.target.value)} className={`${selectCls} ml-1`} title="Filter by worker category">
+                <option value="All">All categories</option>
+                {allCategories().map((c) => <option key={c.id} value={c.id}>{c.label}{usedCats.has(c.id) ? "" : " (0)"}</option>)}
+              </select>
+              <select value={unitF} onChange={(e) => setUnitF(e.target.value)} className={selectCls} title="Filter by unit / branch">
+                <option value="All">All units</option>
+                {units.map((u) => <option key={u} value={u}>{u}</option>)}
+              </select>
+              <select value={deptF} onChange={(e) => setDeptF(e.target.value)} className={selectCls} title="Filter by department">
+                <option value="All">All departments</option>
+                {departments.map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <span className="mx-1 h-5 w-px bg-border" />
+              <select value={monthSel} onChange={(e) => { const m = e.target.value; setMonthSel(m); const dim = new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0).getDate(); setViewDate(`${m}-${String(Math.min(Number(viewDate.slice(8, 10)), dim)).padStart(2, "0")}`); }} className={`${selectCls} font-medium`} title="Switch month — the Days worked / OT columns edit that month, for cross-checking the Excel">
+                {availableMonths(attendance).map((m) => <option key={m} value={m}>{monthLabel(m)}{m === CURRENT_MONTH ? " (current)" : ""}</option>)}
+              </select>
+            </div>
+            <Input placeholder="Search name, ID, dept…" value={q} onChange={(e) => setQ(e.target.value)} className="w-56" />
+          </div>
+          <Table>
+            <THead>
+              <TR>
+                <TH>Emp ID</TH><TH>Name</TH><TH>Category</TH><TH>Department</TH><TH className="text-center" title="Worked unit for the selected date — shuffle to cover absences; master unit stays fixed">Unit<span className="ml-0.5 text-[9px] font-normal text-muted-foreground">(day)</span></TH><TH>Shift</TH>
+                <TH className="text-center">
+                  <button
+                    type="button"
+                    onClick={() => setDatePickerOpen(true)}
+                    title="Change date"
+                    className="inline-flex items-center gap-1 hover:text-primary"
+                  >
+                    <CalendarDays className="h-3.5 w-3.5" /> {viewDateLabel}
+                  </button>
+                </TH>
+                <TH className="text-center">Days worked</TH><TH className="text-center">OT hr</TH><TH></TH>
+              </TR>
+            </THead>
+            <TBody>
+              {rows.map((r) => {
+                const sh = shiftById(r.weekShiftId);
+                return (
+                  <TR key={r.e.id}>
+                    <TD className="font-mono text-xs text-muted-foreground">{r.e.id}</TD>
+                    <TD className="font-medium"><button className="text-left hover:text-primary hover:underline" onClick={() => setDetail(r.e)}>{r.e.name}</button><div className="text-[10px] font-normal text-muted-foreground">details →</div></TD>
+                    <TD><Badge tone="muted">{categoryById(r.e.category)?.label ?? r.e.category}</Badge></TD>
+                    <TD className="text-xs">{r.e.department}</TD>
+                    <TD className="text-center">
+                      {mayEdit ? (
+                        <select
+                          value={r.workedUnit}
+                          title={`Worked unit for ${viewDateFullLabel}. Shuffle to cover absences — master unit (${r.e.unit || "—"}) is unchanged.`}
+                          onChange={(ev) => {
+                            const v = ev.target.value;
+                            setAttendanceDayUnit(r.e.id, viewDate, v === (r.e.unit ?? "") ? "" : v);
+                            toast(v && v !== r.e.unit ? "Shuffled for the day" : "Back to own unit", `${r.e.name} · ${viewDateLabel} → ${v || r.e.unit || "—"} (master kept).`);
+                          }}
+                          className={`${selectCls} w-20 ${r.shuffled ? "text-warning font-semibold" : ""}`}
+                        >
+                          <option value="">—</option>
+                          {units.map((u) => <option key={u} value={u}>{u}</option>)}
+                        </select>
+                      ) : <span className={`text-xs ${r.shuffled ? "text-warning font-semibold" : ""}`}>{r.workedUnit || "—"}</span>}
+                    </TD>
+                    <TD>
+                      <select
+                        value={r.weekShiftId}
+                        onChange={(ev) => {
+                          setWeekShift(r.e.id, CURRENT_WEEK_ROW, ev.target.value);
+                          toast("Shift updated", `${r.e.name} moved to ${shiftById(ev.target.value)?.code} — ${shiftById(ev.target.value)?.name} for this week.`);
+                        }}
+                        title={`${sh?.time} — this week only; use the calendar icon for other weeks`}
+                        className="h-7 rounded-md border border-input bg-card px-1.5 text-[11px] text-info focus:outline-none focus:ring-1 focus:ring-ring"
+                      >
+                        {SHIFTS.map((s) => (
+                          <option key={s.id} value={s.id}>{s.code} · {s.hours}h</option>
+                        ))}
+                      </select>
+                    </TD>
+                    <TD className="text-center">
+                      <select
+                        value={r.dayShift ? `S:${r.dayShift}` : r.dayStatus ?? ""}
+                        title={`Mark ${viewDateFullLabel} with the muster code — D/H/F/G = 8-hour shift, X/Y = 12-hour shift`}
+                        onChange={(ev) => {
+                          const v = ev.target.value;
+                          if (!v) { clearAttendanceDay(r.e.id, viewDate); toast("Cleared", `${r.e.name} — ${viewDateFullLabel} mark removed.`); }
+                          else if (v.startsWith("S:")) { markAttendanceDay(r.e.id, viewDate, "Present", undefined, v.slice(2)); toast("Marked", `${r.e.name} — shift ${v.slice(2)} on ${viewDateFullLabel}. Month days & OT recalculated.`); }
+                          else { markAttendanceDay(r.e.id, viewDate, v as AttendanceStatus); toast("Marked", `${r.e.name} — ${v} on ${viewDateFullLabel}.`); }
+                        }}
+                        className={`${selectCls} w-[104px] ${r.dayStatus ? attendanceStatusTone(r.dayStatus) === "success" ? "text-success" : attendanceStatusTone(r.dayStatus) === "danger" ? "text-danger" : "text-info" : "text-muted-foreground"}`}
+                      >
+                        <option value="">— mark —</option>
+                        <optgroup label="Present — 8 hr">
+                          <option value="S:D">D · Day</option>
+                          <option value="S:H">H · Half night</option>
+                          <option value="S:F">F · Full night</option>
+                          <option value="S:G">G · General</option>
+                        </optgroup>
+                        <optgroup label="Present — 12 hr">
+                          <option value="S:X">X · Day 12h</option>
+                          <option value="S:Y">Y · Night 12h</option>
+                        </optgroup>
+                        <option value="Present">Present (no code)</option>
+                        <option value="Half Day">Half Day</option>
+                        <option value="Absent">A · Absent</option>
+                        <option value="Leave">L · Leave</option>
+                        <option value="Holiday">Holiday</option>
+                      </select>
+                    </TD>
+                    <TD className="text-center">
+                      {r.paid && <div className="text-[9px] font-semibold uppercase tracking-wide text-success" title="Figures as paid in the salary register. Editing re-computes this month.">register</div>}
+                      {mayEdit
+                        ? <Input type="text" value={String(r.daysWorked)} onChange={(ev) => setAttendance(r.e.id, { daysWorked: num(ev.target.value) }, monthSel)} className="mx-auto h-7 w-14 text-center" />
+                        : <span className="text-xs font-medium">{r.daysWorked}</span>}
+                    </TD>
+                    <TD className="text-center">
+                      {otEditable ? (
+                        <Input type="text" value={String(r.otHours)} onChange={(ev) => setAttendance(r.e.id, { otHours: num(ev.target.value) }, monthSel)} className="mx-auto h-7 w-12 text-center" />
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-xs" title="OT editing is locked after the current week — Admin/CEO only">
+                          {r.otHours} <Lock className="h-3 w-3 text-muted-foreground" />
+                        </span>
+                      )}
+                    </TD>
+                    <TD className="text-right">
+                      <Button variant="ghost" size="icon" className="h-7 w-7" title="Attendance calendar — view & mark days" onClick={() => setCalEmp(r.e)}>
+                        <CalendarDays className="h-4 w-4" />
+                      </Button>
+                    </TD>
+                  </TR>
+                );
+              })}
+            </TBody>
+          </Table>
+          {rows.length === 0 && <p className="py-8 text-center text-sm text-muted-foreground">No workers match.</p>}
+          <p className="mt-3 text-xs text-muted-foreground">
+            Tip: mark attendance inline from the “{viewDateLabel}” column — click its <CalendarDays className="inline h-3 w-3 align-text-top" /> header to switch dates; edits recompute incentives + payroll.
+            {otEditable ? " OT is open for editing this week." : " OT editing is locked for this period — only Admin/CEO can change it now."}
+          </p>
+        </CardContent>
+      </Card>
+
+      {detail && (() => {
+        const a = attendanceFor(attendance, detail.id, monthSel);
+        const sh = shiftById(detail.shiftId);
+        const weeks = a?.weekDaysWorked ?? [0, 0, 0, 0];
+        const scheme = schemeFromSource(a?.paid?.src) ?? wageSchemeFor(detail.category);
+        const incAmt = a?.paid ? a.paid.incentive : monthlyIncentive(a?.daysWorked ?? 0, scheme);
+        return (
+          <DetailSheet
+            title={`${detail.name} — Attendance & Shift`}
+            subtitle={`${detail.id} · ${categoryById(detail.category)?.label ?? detail.category} · ${monthLabel(monthSel)}`}
+            badges={[{ label: `Shift ${sh?.code} — ${sh?.name}`, tone: "info" }, { label: `${a?.daysWorked ?? 0} days worked`, tone: "success" }]}
+            onClose={() => setDetail(null)}
+            sections={[
+              { heading: "Shift", rows: [["Shift", sh ? `${sh.code} — ${sh.name}` : "—"], ["Timing", sh?.time ?? "—"], ["Hours", `${sh?.hours ?? "—"}`], ["Department", detail.department]] },
+              { heading: "Month summary", stats: [
+                { label: "Days worked", value: `${a?.daysWorked ?? 0}` },
+                { label: "Paid from", value: a?.paid ? "Register" : "Marks" },
+                { label: "OT hours", value: `${a?.otHours ?? 0}` },
+                { label: "Absent", value: `${a?.absent ?? 0}` },
+              ] },
+              { heading: "Week-by-week", table: {
+                cols: ["Week", "Days worked"], right: [false, true],
+                rows: WEEK_LABELS.map((w, i) => [w, String(weeks[i] ?? 0)]),
+              } },
+              { heading: "Attendance incentive", rows: [
+                ["This month", incAmt ? formatINR(incAmt) : "— (needs 26+ days)"],
+                ["Slabs", scheme === "hostel" ? "26–27 days ₹10/day · 28+ ₹20/day" : scheme === "odisha" ? "26–27 days ₹15/day · 28+ ₹30/day" : "As per statement"],
+              ], note: "Mark days with the muster code or edit days / OT in the row; changes are audited and flow into payroll." },
+            ]}
+          />
+        );
+      })()}
+
+      {datePickerOpen && (
+        <DatePickerModal
+          value={viewDate}
+          today={TODAY}
+          title="Select date — Attendance"
+          onSelect={(date) => { setViewDate(date); setDatePickerOpen(false); }}
+          onClose={() => setDatePickerOpen(false)}
+        />
+      )}
+
+      {importOpen && (
+        <AttendanceImportModal
+          employees={employees}
+          onApply={(records) => {
+            applyDailyAttendance(records);
+            toast("Attendance imported", `${records.length} day-records applied for ${TODAY.slice(0, 7)}.`);
+          }}
+          onClose={() => setImportOpen(false)}
+        />
+      )}
+
+      {calEmp && (() => {
+        // Re-read from the store so a shift change picked below reflects immediately —
+        // calEmp itself is a snapshot taken when the calendar was opened.
+        const liveCalEmp = employees.find((e) => e.id === calEmp.id) ?? calEmp;
+        return (
+          <AttendanceCalendar
+            employee={liveCalEmp}
+            month={monthSel}
+            today={TODAY}
+            daily={dailyAttendance}
+            weekShiftIds={attendanceFor(attendance, calEmp.id, monthSel)?.weekShiftIds}
+            onMark={(date, status) => markAttendanceDay(calEmp.id, date, status)}
+            onClear={(date) => clearAttendanceDay(calEmp.id, date)}
+            onWeekShiftChange={(weekRow, shiftId) => {
+              setWeekShift(calEmp.id, weekRow, shiftId);
+              toast("Shift updated", `${calEmp.name} moved to ${shiftById(shiftId)?.code} — ${shiftById(shiftId)?.name} for that week.`);
+            }}
+            onClose={() => setCalEmp(null)}
+          />
+        );
+      })()}
+    </>
+  );
+}
